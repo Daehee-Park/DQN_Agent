@@ -1,0 +1,367 @@
+# Make DQN Agent for maximizing profit
+# input data: open, high, low, close, volume, RSI(n=14), EMA(n=40), EMA(n=120), EMA(n=200)
+
+import pandas as pd
+import datetime
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import numpy as np
+import requests
+import tensorflow as tf
+import random
+
+# Define class for trading bot
+class TradingBot:
+    # define init function
+    def __init__(self, symbol, interval, limit):
+        self.symbol = symbol
+        self.interval = interval
+        self.limit = limit
+        self.df = self.get_data()
+        self.df = self.clean_data()
+        self.df = self.add_indicators()
+        # define hyperparameters
+        self.num_episodes = 120
+        self.action_size = 3
+        self.learning_rate = 0.001
+        self.gamma = 0.99 # discount rate
+        self.epsilon = 1.0
+        self.epsilon_decay = 0.999
+        self.epsilon_min = 0.01
+        self.batch_size = 32
+        self.memory_size = 400
+        self.memory = []
+        # plot
+        self.plot_chart()
+
+    # define function to get data from binance api
+    def get_data(self):
+        symbol = self.symbol
+        interval = self.interval
+        limit = self.limit
+        df= requests.get(f'https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}')
+        df = pd.DataFrame(df.json())
+        return df
+
+    # define clean data function
+    def clean_data(self):
+        df = self.df
+        df = df.iloc[:, 0:6]
+        df.columns = ['timestamp', 'open', 'high', 'low', 'close', 'volume']
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        #convert to korean time
+        df['timestamp'] = df['timestamp'] + datetime.timedelta(hours=9)
+        df.set_index('timestamp', inplace=True)
+        df = df.astype(float)
+        return df
+
+    # define function to add indicators
+    def add_indicators(self):
+        df = self.df
+        #define least square moving average
+        df['ema_40'] = df['close'].ewm(span=40, adjust=False).mean()
+        df['ema_120'] = df['close'].ewm(span=120, adjust=False).mean()
+        df['ema_200'] = df['close'].ewm(span=200, adjust=False).mean()
+        df['lsma_10'] = df['close'].rolling(10).apply(lambda x: np.sum(x * np.arange(1, len(x) + 1)) / np.sum(np.arange(1, len(x) + 1)), raw=True)
+        df['lsma_30'] = df['close'].rolling(30).apply(lambda x: np.sum(x * np.arange(1, len(x) + 1)) / np.sum(np.arange(1, len(x) + 1)), raw=True)
+        df['rsi'] = self.rsi(df['close'])
+        df['atr'] = self.atr(df['high'], df['low'], df['close'])
+        df['HARSI']= self.HARSI(df['close'])
+        df['MACD'] = self.MACD(df['close'])
+        df['supertrend'], df['final_ub'], df['final_lb'] = self.supertrend()
+        return df
+
+    # define rsi function
+    def rsi(self, close, period=14):
+        delta = close.diff()
+        up, down = delta.copy(), delta.copy()
+        up[up < 0] = 0
+        down[down > 0] = 0
+        roll_up1 = up.ewm(com=period-1, min_periods=period).mean()
+        roll_down1 = down.ewm(com=period-1, min_periods=period).mean().abs()
+        rs1 = roll_up1 / roll_down1
+        rsi = 100 - 100 / (1 + rs1)
+        return rsi
+
+    # define atr function
+    def atr(self, high, low, close, period=10):
+        tr = high - low
+        tr1 = high - close.shift(1)
+        tr2 = low - close.shift(1)
+        tr = tr.combine(tr1, max)
+        tr = tr.combine(tr2, max)
+        atr = tr.ewm(com=period-1, min_periods=period).mean()
+        return atr
+
+    # define HARSI function (Heiken Ashi RSI Oscillator)
+    # Normallize range of -40~40
+    def HARSI(self, close, period=14):
+        ha_close = (close.shift(1) + close) / 2
+        ha_open = (close.shift(1) + close.shift(1).shift(1)) / 2
+        ha_high = ha_close.combine(ha_open, max)
+        ha_high = ha_high.combine(close, max)
+        ha_low = ha_close.combine(ha_open, min)
+        ha_low = ha_low.combine(close, min)
+        ha_rsi = self.rsi(ha_close, period)
+        harsi = (ha_rsi - 50) * 2
+        # normalize range of -40~40
+        harsi = (harsi - harsi.min()) / (harsi.max() - harsi.min()) * 80 - 40
+        # add smoothing factor
+        harsi = harsi.ewm(span=3).mean()
+        return harsi
+
+    # define MACD function(Moving Average Convergence Divergence) using fast length, slow length
+    def MACD(self, close, fast=12, slow=26, signal=8):
+        macd = close.ewm(span=fast, adjust=False).mean() - close.ewm(span=slow, adjust=False).mean()
+        signal = macd.ewm(span=signal, adjust=False).mean()
+        return macd - signal
+
+    # define super trend function
+    def supertrend(self, period=10, multiplier=3):
+        df = self.df
+        df['atr'] = self.atr(df['high'], df['low'], df['close'])
+        df['basic_ub'] = (df['high'] + df['low']) / 2 + multiplier * df['atr']
+        df['basic_lb'] = (df['high'] + df['low']) / 2 - multiplier * df['atr']
+        df['final_ub'] = 0.00
+        df['final_lb'] = 0.00
+        df['supertrend'] = 0.00
+
+        for i in range(period, len(df)):
+            if df['basic_ub'][i-1] < df['final_ub'][i-1] or df['close'][i-1] > df['final_ub'][i-1]:
+                df['final_ub'][i] = df['basic_ub'][i]
+            else:
+                df['final_ub'][i] = df['final_ub'][i-1]
+
+            if df['basic_lb'][i-1] > df['final_lb'][i-1] or df['close'][i-1] < df['final_lb'][i-1]:
+                df['final_lb'][i] = df['basic_lb'][i]
+            else:
+                df['final_lb'][i] = df['final_lb'][i-1]
+
+            if df['supertrend'][i-1] == df['final_ub'][i-1] and df['close'][i] <= df['final_ub'][i]:
+                df['supertrend'][i] = df['final_ub'][i]
+            elif df['supertrend'][i-1] == df['final_ub'][i-1] and df['close'][i] >= df['final_ub'][i]:
+                df['supertrend'][i] = df['final_lb'][i]
+            elif df['supertrend'][i-1] == df['final_lb'][i-1] and df['close'][i] >= df['final_lb'][i]:
+                df['supertrend'][i] = df['final_lb'][i]
+            elif df['supertrend'][i-1] == df['final_lb'][i-1] and df['close'][i] <= df['final_lb'][i]:
+                df['supertrend'][i] = df['final_ub'][i]
+            else:
+                df['supertrend'][i] = 0.00
+
+        return df['supertrend'], df['final_ub'], df['final_lb']
+
+    # define function to get state # state는 close, volume, ema_40, ema_120, ema_200, rsi, supertrend, macd
+    def get_state(self, t):
+        df = self.df
+        state = [
+            df['close'][t],
+            df['volume'][t],
+            df['ema_40'][t],
+            df['ema_120'][t],
+            df['ema_200'][t],
+            df['rsi'][t],
+            df['supertrend'][t],
+            df['MACD'][t]
+        ]
+        return np.array(state)
+
+    # define function to get action
+    def get_action(self, state):
+        if np.random.rand() <= self.epsilon:
+            # random action shape = (3,)
+            return random.randrange(self.action_size)
+        else:
+            return np.argmax(self.model().predict(state)[0]) # predict action (buy, sell, hold) # 0, 1, 2
+
+    # define function to replay memory
+    def replay_memory(self, state, action, reward, next_state):
+        # append data to replay memory
+        self.memory.append((state, action, reward, next_state))
+        # if replay memory is full, remove the oldest data
+        if len(self.memory) > self.memory_size:
+            self.memory.pop(0)
+
+    # define model using tensorflow
+    def model(self):
+        model = tf.keras.Sequential()
+        # LSTM 모델을 사용하여 학습
+        model.add(tf.keras.layers.LSTM(32, input_shape=(1, 8), return_sequences=True))
+        model.add(tf.keras.layers.LSTM(32, return_sequences=True))
+        model.add(tf.keras.layers.LSTM(128))
+        model.add(tf.keras.layers.Dropout(0.2))
+        # 3개의 action에 대한 Q value를 출력
+        model.add(tf.keras.layers.Dense(3, activation='linear'))
+        model.compile(loss='mse', optimizer=tf.keras.optimizers.Adam(learning_rate=self.learning_rate))
+        return model
+
+    # define function to train model
+    def train_model(self):
+        # train model
+        df = self.df.iloc[-120:, :]
+        budget = 1000  # 초기 예산
+        initial_budget = budget  # 초기 예산을 기록
+        total_budget = budget  # 코인 가치를 포함한 총 예산
+        trade_proportion = 0.1  # 한 번에 거래할 비중= budget * trade_proportion
+        position_price = 0  # 내가 갖고 있는 코인의 position price
+        position_quantity = 0  # 내가 갖고 있는 코인의 수량
+        position = 0  # 내가 갖고 있는 코인의 position (long: 1, short: -1)
+        profit = total_budget / initial_budget * 100  # 수익률(%)
+        for i in range(119):
+            state = self.get_state(i) # state shape: (8,)
+            action = self.get_action(state) # action shape: (3,)
+
+            # action이 0이면 short, 1이면 hold, 2이면 long position을 택하라는 signal이다.
+            # 만약 long position을 택했을 경우, signal이 발생한 시점의 open price를 기록한다.
+            # 만약 long position 갖고 있고, sell signal이 발생하지 않았을 경우, 현재 price와 open price의 차이를 계속해서 수익률에 더해준다.
+            # 만약 long position을 갖고 있는 경우인데, long position signal이 발생하면, position price를 평균으로 계산한다.
+            if action == 2:  # long position
+                if position_quantity == 0:  # 아직 코인을 갖고 있지 않은 경우
+                    position_price = df['open'][i]
+                    position_quantity = budget * trade_proportion / position_price
+                    # 코인 가치: position_price * position_quantity
+                    budget *= trade_proportion
+                    total_budget = budget + position_price * position_quantity
+                    profit = total_budget / initial_budget * 100
+                    position = 1
+                elif position == 1:  # 이미 long position을 갖고 있는 경우
+                    position_price = (position_price + df['open'][i]).mean()
+                    position_quantity += budget * trade_proportion / position_price
+                    budget *= trade_proportion
+                    total_budget = budget + position_price * position_quantity
+                    profit = total_budget / initial_budget * 100
+                elif position == -1:  # 이미 short position을 갖고 있는 경우
+                    budget += (position_price - df['open'][i]) * position_quantity
+                    position_price = df['open'][i]
+                    position_quantity = budget * trade_proportion / position_price
+                    budget *= trade_proportion
+                    total_budget = budget + position_price * position_quantity
+                    profit = total_budget / initial_budget * 100
+                    position = 1
+            elif action == 0:  # short position
+                if position_quantity == 0:  # 아직 코인을 갖고 있지 않은 경우
+                    position_price = df['open'][i]
+                    position_quantity = budget * trade_proportion / position_price
+                    # 코인 가치: position_price * position_quantity
+                    budget *= trade_proportion
+                    total_budget = budget + position_price * position_quantity
+                    profit = total_budget / initial_budget * 100
+                    position = -1
+                elif position == -1:  # 이미 short position을 갖고 있는 경우
+                    position_price = (position_price + df['open'][i]).mean()
+                    position_quantity += budget * trade_proportion / position_price
+                    budget *= trade_proportion
+                    total_budget = budget + position_price * position_quantity
+                    profit = total_budget / initial_budget * 100
+                elif position == 1:  # 이미 long position을 갖고 있는 경우
+                    budget += (df['open'][i] - position_price) * position_quantity
+                    position_price = df['open'][i]
+                    position_quantity = budget * trade_proportion / position_price
+                    budget *= trade_proportion
+                    total_budget = budget + position_price * position_quantity
+                    profit = total_budget / initial_budget * 100
+                    position = -1
+            elif action == 1:  # hold
+                if position == 1:  # long position을 갖고 있는 경우
+                    # 코인 가치 변화에 따른 total budget를 업데이트
+                    # 현 예산은 변화가 없다.
+                    if position_quantity > 0:
+                        if position == 1:
+                            total_budget = budget + (df['open'][
+                                                         i] - position_price) * position_quantity + position_price * position_quantity
+                            profit = total_budget / initial_budget * 100
+                        elif position == -1:
+                            total_budget = budget + (position_price - df['open'][
+                                i]) * position_quantity + position_price * position_quantity
+                            profit = total_budget / initial_budget * 100
+                # total_budget과 profit을 df에 저장
+            reward = profit / 100 - 1
+            next_state = self.get_state(i+1)
+            self.replay_memory(state, action, reward, next_state)
+            target = self.model().predict(state.reshape(1, 1, 8))
+            target_val = self.model().predict(next_state.reshape(1, 1, 8))
+            target[0][np.argmax(action)] = reward + self.gamma * np.max(target_val)
+            self.model().fit(state.reshape(1, 1, 8), target, epochs=1, verbose=0)
+            print('epoch: ', i, 'state: ', state, 'action: ', action, 'total_budget: ', total_budget, 'profit: ', profit)
+
+    # define function to plot chart using plotly
+    def plot_chart(self):
+        pd.set_option('mode.chained_assignment', 'warn')  # SettingWithCopyWarning
+        # create 2 subplots using plotly pretty
+        df = self.df.iloc[-120:, :]
+        fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.03,
+                            specs=[[{"type": "scatter"}],
+                                   [{"type": "scatter"}]])
+        # add close price
+        fig.add_trace(go.Scatter(x=df.index,
+                                    y=df['close'],
+                                    mode='lines',
+                                    name='Close Price'), row=1, col=1)
+
+        # add ema40
+        fig.add_trace(go.Scatter(x=df.index,
+                                    y=df['ema_40'],
+                                    mode='lines',
+                                    name='EMA40'), row=1, col=1)
+
+        # add ema120
+        fig.add_trace(go.Scatter(x=df.index,
+                                    y=df['ema_120'],
+                                    mode='lines',
+                                    name='EMA120'), row=1, col=1)
+
+        # add ema200
+        fig.add_trace(go.Scatter(x=df.index,
+                                    y=df['ema_200'],
+                                    mode='lines',
+                                    name='EMA200'), row=1, col=1)
+
+        # add super trend
+        fig.add_trace(go.Scatter(x=df.index,
+                                    y=df['supertrend'],
+                                    mode='lines',
+                                    name='SuperTrend'), row=1, col=1)
+
+        # add MACD as histogram
+        fig.add_trace(go.Bar(x=df.index,
+                                y=df['MACD'],
+                                name='MACD'), row=2, col=1)
+
+        # add volume
+        fig.add_trace(go.Bar(x=df.index,
+                                y=df['volume'],
+                                name='Volume'), row=2, col=1)
+
+        # add RSI
+        fig.add_trace(go.Scatter(x=df.index,
+                                    y=df['rsi'],
+                                    mode='lines',
+                                    name='RSI'), row=2, col=1)
+
+        # Update xaxis properties
+        fig.update_xaxes(title_text="Date", row=1, col=1)
+        fig.update_xaxes(title_text="Date", row=2, col=1)
+        # Update yaxis properties
+        fig.update_yaxes(title_text="Price", row=1, col=1)
+        fig.update_yaxes(title_text="MACD", row=2, col=1)
+        # Update title and height
+        fig.update_layout(title_text=self.symbol + ' ' + self.interval + ' Chart', height=800, width=1200)
+        # Set theme, margin, and annotation in layout
+        fig.update_layout(template='plotly_dark', margin=dict(t=50, b=50, l=50, r=50))
+
+        # remove grid
+        fig.update_xaxes(showgrid=False)
+        fig.update_yaxes(showgrid=False)
+
+        # remove zoom
+        fig.update_xaxes(rangeslider_visible=False)
+        fig.update_xaxes(showspikes=False)
+        fig.update_yaxes(showspikes=False)
+
+        # show plot
+        fig.show()
+
+# load trading bot class and run strategy
+if __name__ == '__main__':
+    trading_bot = TradingBot('BTCUSDT', '1m', 400)
+    # train
+    trading_bot.train_model()
